@@ -61,4 +61,12 @@ window.KAKI_CONFIG = {
   // 紹介した人がもらえるのは maxPerReferrer 人まで。期間＝from〜until（日本時間・サーバー時刻）。from は登録日の下限（それより前からの会員は「紹介された」にならない）
   // 🟥 until を延ばすときは Firestore ルール（kakiapp_referrals の期限）も同じ日に直す
   referral: { from: "2026-10-08", until: "2026-10-31", points: 50, maxPerReferrer: 10 },
+
+  // みんなの一杯（写真の掲示板・masa 決定 2026-09-21／2026-10-08 確認）: その日に来店チェックインした人だけ・1日1投稿・投稿で points（1日1回）。
+  // maxChars＝ひとことの文字数（🟥 Firestore ルールの text.size() <= 30 と揃える）。hideAfterReports＝この数の通報で自動的に見えなくなる（admin で表示に戻せる）
+  // ngWords＝投稿できない言葉（ひとこと・ニックネーム）。masa が足したいときはここに1語ずつ足す（ひらがな・カタカナは別々に書く）
+  board: {
+    points: 20, maxChars: 30, hideAfterReports: 2,
+    ngWords: ["死ね", "しね", "殺す", "ころす", "うんこ", "セックス", "ちんこ", "まんこ", "バカ", "ばか", "アホ", "あほ", "キモい", "きもい"],
+  },
 };

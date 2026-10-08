@@ -11,7 +11,7 @@ import {
   RecaptchaVerifier, signInWithPhoneNumber, linkWithPhoneNumber,
   PhoneAuthProvider, linkWithCredential
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
-import { initializeFirestore, doc, getDoc, setDoc, deleteDoc, collection, getDocs, addDoc, updateDoc, increment, query, where } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+import { initializeFirestore, doc, getDoc, setDoc, deleteDoc, collection, getDocs, addDoc, updateDoc, increment, query, where, orderBy, limit, startAfter, writeBatch } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 
 const app = initializeApp({
   apiKey: "AIzaSyDtDZIEQtBzjujnpTDcXt1QeEU2r-wbg74",
@@ -42,7 +42,8 @@ const KEYS = ["points", "visits", "tx", "rouletteDate", "gachaDate", "qrDate", "
   "createdAt", "claimed", "rankBonus",   /* 使い始めた日・キャンペーン受取・ランクアップ受取（二重取り防止）2026-09-10 */
   "teamId", "team", "teamJoinedAt", "teamVisits",   /* 学校対抗 来店バトル（任意参加・自分の学校と月別の自分の来店数）2026-09-21 */
   "nickname", "awards", "awardsSeen",
-  "referredBy", "refClaimed"];   /* 友だち紹介キャンペーン: 自分を紹介した人／紹介した人の成立分の受け取り済み（二重取り防止）2026-10-08 */   /* ニックネーム／シーズン結果（awards＝運営だけが書く・本人は書けない）／受け取り済み（awardsClaimed＝本人が書く）2026-09-21 エル監査対応 */
+  "referredBy", "refClaimed",   /* 友だち紹介キャンペーン（下の注記） */
+  "boardDate"];   /* みんなの一杯: 投稿ポイントを受け取った日（1日1回・二重取り防止）2026-10-08 */   /* 友だち紹介キャンペーン: 自分を紹介した人／紹介した人の成立分の受け取り済み（二重取り防止）2026-10-08 */   /* ニックネーム／シーズン結果（awards＝運営だけが書く・本人は書けない）／受け取り済み（awardsClaimed＝本人が書く）2026-09-21 エル監査対応 */
 
 
 let uid = null, ready = false, timer = null;
@@ -452,6 +453,69 @@ window.kakiRef = {
   qualified: async () => { if (!uid) return [];
     const snap = await withTimeout(getDocs(query(collection(db, "kakiapp_referrals"), where("referrer", "==", uid), where("status", "==", "qualified"))), 12000, "refList");
     const arr = []; snap.forEach(d => arr.push(Object.assign({ id: d.id }, d.data()))); arr.sort((a, b) => String(a.qualifiedAt || "").localeCompare(String(b.qualifiedAt || ""))); return arr; },
+};
+
+/* ---- みんなの一杯（写真の掲示板・masa 決定 2026-09-21／2026-10-08 確認）----
+   投稿＝ kakiapp_board/{uid}_{日付} = {uid, name, text, shop, img:"doc", createdAt, day, likes:0, reports:0, hidden:false, igOk}
+   （doc id に日付を入れる＝1人1日1件をルールで保証。投稿できるのは kakiapp_users の qrDate が今日＝来店チェックインした日だけ）
+   写真＝ kakiapp_board_img/{同じid} = {uid, data:"data:image/jpeg;base64,…", createdAt}。Firebase Storage はこのプロジェクトで未設定なので
+   端末で 720px・JPEG に縮めて別 doc に置く（投稿 doc を軽く保ち、一覧は文字だけ先に読める）
+   ♥＝ kakiapp_board/{id}/likes/{uid}、通報＝ …/reports/{uid}。数（likes/reports）は doc の作成・削除と同じ batch で ±1（ルールで突き合わせ） */
+const BOARD = "kakiapp_board", BOARD_IMG = "kakiapp_board_img", BOARD_PAGE = 20;
+const boardImgCache = new Map();
+window.kakiBoard = {
+  uid: () => uid,
+  /* 新しい順に20件。after＝前のページの最後（続きを読む） */
+  page: async after => {
+    const base = collection(db, BOARD);
+    const q = after ? query(base, orderBy("createdAt", "desc"), startAfter(after), limit(BOARD_PAGE)) : query(base, orderBy("createdAt", "desc"), limit(BOARD_PAGE));
+    const snap = await withTimeout(getDocs(q), 12000, "board");
+    const items = []; snap.forEach(d => items.push(Object.assign({ id: d.id }, d.data())));
+    return { items, last: snap.docs.length ? snap.docs[snap.docs.length - 1] : null, done: snap.docs.length < BOARD_PAGE };
+  },
+  /* 写真（data URL）。一度読んだものは覚えておく */
+  img: async id => {
+    if (boardImgCache.has(id)) return boardImgCache.get(id);
+    const snap = await withTimeout(getDoc(doc(db, BOARD_IMG, id)), 12000, "boardImg");
+    const v = snap.exists() ? String(snap.data().data || "") : "";
+    if (v) boardImgCache.set(id, v);
+    return v;
+  },
+  liked: async id => { if (!uid) return false; const s = await withTimeout(getDoc(doc(db, BOARD, id, "likes", uid)), 8000, "boardLiked"); return s.exists(); },
+  reported: async id => { if (!uid) return false; const s = await withTimeout(getDoc(doc(db, BOARD, id, "reports", uid)), 8000, "boardReported"); return s.exists(); },
+  /* 投稿。先に会員データ（qrDate）をクラウドへ書き切る＝ルールの「今日来店した人だけ」に間に合わせる */
+  post: async ({ name, text, shop, igOk, dataUrl, day, createdAt }) => {
+    if (!uid || !auth.currentUser) throw Object.assign(new Error("not signed in"), { code: "board/auth" });
+    clearTimeout(timer); await write();
+    const id = uid + "_" + day, b = writeBatch(db);
+    b.set(doc(db, BOARD, id), { uid, name, text, shop, img: "doc", createdAt, day, likes: 0, reports: 0, hidden: false, igOk: !!igOk });
+    b.set(doc(db, BOARD_IMG, id), { uid, data: dataUrl, createdAt });
+    await withTimeout(b.commit(), 25000, "boardPost");
+    boardImgCache.set(id, dataUrl);
+    return id;
+  },
+  exists: async id => { const s = await withTimeout(getDoc(doc(db, BOARD, id)), 8000, "boardGet"); return s.exists(); },
+  /* ♥ をつける／はずす（1人1回・数は ±1） */
+  like: async (id, on) => {
+    if (!uid) throw Object.assign(new Error("not signed in"), { code: "board/auth" });
+    const b = writeBatch(db), lr = doc(db, BOARD, id, "likes", uid);
+    if (on) { b.set(lr, { uid, at: new Date().toISOString() }); b.update(doc(db, BOARD, id), { likes: increment(1) }); }
+    else { b.delete(lr); b.update(doc(db, BOARD, id), { likes: increment(-1) }); }
+    await withTimeout(b.commit(), 12000, "boardLike");
+  },
+  /* 通報（1人1回・数は +1） */
+  report: async id => {
+    if (!uid) throw Object.assign(new Error("not signed in"), { code: "board/auth" });
+    const b = writeBatch(db);
+    b.set(doc(db, BOARD, id, "reports", uid), { uid, at: new Date().toISOString() });
+    b.update(doc(db, BOARD, id), { reports: increment(1) });
+    await withTimeout(b.commit(), 12000, "boardReport");
+  },
+  /* 自分の投稿を消す（写真の doc も一緒に） */
+  remove: async id => {
+    const b = writeBatch(db); b.delete(doc(db, BOARD, id)); b.delete(doc(db, BOARD_IMG, id));
+    await withTimeout(b.commit(), 12000, "boardDelete"); boardImgCache.delete(id);
+  },
 };
 
 /* ---- 入口 ---- */
