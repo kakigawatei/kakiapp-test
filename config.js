@@ -56,4 +56,9 @@ window.KAKI_CONFIG = {
     defaultRewards: { r1: 200, r2: 100, r3: 50, mvp: 50 },
     minMembersForRank: 2,
   },
+
+  // 友だち紹介キャンペーン（masa 決定 2026-10-08）: 紹介された人が初めて来店ガチャを回したら、紹介した人・された人の両方に points。
+  // 紹介した人がもらえるのは maxPerReferrer 人まで。期間＝from〜until（日本時間・サーバー時刻）。from は登録日の下限（それより前からの会員は「紹介された」にならない）
+  // 🟥 until を延ばすときは Firestore ルール（kakiapp_referrals の期限）も同じ日に直す
+  referral: { from: "2026-10-08", until: "2026-10-31", points: 50, maxPerReferrer: 10 },
 };

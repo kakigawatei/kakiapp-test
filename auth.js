@@ -11,7 +11,7 @@ import {
   RecaptchaVerifier, signInWithPhoneNumber, linkWithPhoneNumber,
   PhoneAuthProvider, linkWithCredential
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
-import { initializeFirestore, doc, getDoc, setDoc, deleteDoc, collection, getDocs, addDoc, updateDoc, increment } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+import { initializeFirestore, doc, getDoc, setDoc, deleteDoc, collection, getDocs, addDoc, updateDoc, increment, query, where } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 
 const app = initializeApp({
   apiKey: "AIzaSyDtDZIEQtBzjujnpTDcXt1QeEU2r-wbg74",
@@ -41,7 +41,8 @@ const KEYS = ["points", "visits", "tx", "rouletteDate", "gachaDate", "qrDate", "
   "storeVisits", "lastStore", "lastStoreAt",   /* どの店に来たか。送り分けに使う 2026-09-03 */
   "createdAt", "claimed", "rankBonus",   /* 使い始めた日・キャンペーン受取・ランクアップ受取（二重取り防止）2026-09-10 */
   "teamId", "team", "teamJoinedAt", "teamVisits",   /* 学校対抗 来店バトル（任意参加・自分の学校と月別の自分の来店数）2026-09-21 */
-  "nickname", "awards", "awardsSeen"];   /* ニックネーム／シーズン結果（awards＝運営だけが書く・本人は書けない）／受け取り済み（awardsClaimed＝本人が書く）2026-09-21 エル監査対応 */
+  "nickname", "awards", "awardsSeen",
+  "referredBy", "refClaimed"];   /* 友だち紹介キャンペーン: 自分を紹介した人／紹介した人の成立分の受け取り済み（二重取り防止）2026-10-08 */   /* ニックネーム／シーズン結果（awards＝運営だけが書く・本人は書けない）／受け取り済み（awardsClaimed＝本人が書く）2026-09-21 エル監査対応 */
 
 
 let uid = null, ready = false, timer = null;
@@ -208,6 +209,7 @@ $("gDoSignup").onclick = async () => {
     st.mailOptIn = ok;
     st.mailOptInAt = new Date().toISOString();
     if (window.kakiSetState) window.kakiSetState(st);
+    refSavePending($("gRef") && $("gRef").value);   /* 紹介コード（任意）。確認メール→電話番号のあと、初回ログインで記録する */
   } catch (e) { msg(jaError(e)); } finally { busy(false); }
 };
 
@@ -384,6 +386,74 @@ window.kakiTeams = {
   sync: async () => { const st = window.kakiGetState(); if (!st.teamId) return null; const arr = await teamList(); const t = teamResolve(arr, st.teamId); if (!t) return null; if (t.id !== st.teamId || t.name !== st.team) { const s2 = window.kakiGetState(); s2.teamId = t.id; s2.team = t.name; window.kakiSetState(s2); window.cloudPush(); } return t; },
 };
 
+/* ---- 友だち紹介キャンペーン（masa 決定 2026-10-08）----
+   コード＝uid から決まる6文字（紛らわしい 0/O/1/I は使わない32文字）。kakiapp_refcodes/{コード} = {uid, createdAt}（本人が作るだけ・書き換え不可）
+   紹介の記録＝ kakiapp_referrals/{紹介された人のuid} = {referrer, referee, code, createdAt, status:"pending"}（doc id が本人＝1人1回）
+   成立＝紹介された人が status を "qualified" にする（index.html の refQualify）。紹介した人は自分宛ての qualified を数えて受け取る（applyReferrals） */
+const REF_ABC = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const REF_RE = /^[2-9A-HJ-NP-Z]{6}$/;
+function refCodeOf(id) {
+  /* cyrb53（53bit の速いハッシュ）→ 下位30bit を5bitずつ6文字に */
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < id.length; i++) { const c = id.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  let n = (h1 >>> 0) ^ ((h2 & 0x1fffff) << 9), out = "";
+  for (let i = 0; i < 6; i++) { out += REF_ABC[n & 31]; n >>>= 5; }
+  return out;
+}
+const refNorm = v => String(v || "").normalize("NFKC").replace(/[\s\-]/g, "").toUpperCase();
+function refSavePending(v) {
+  const c = refNorm(v); if (!REF_RE.test(c)) return;
+  try { sessionStorage.setItem("kakiRef", c); localStorage.setItem("kakiRef", c); } catch (_) {}   /* 確認メールで別タブになっても残るよう localStorage にも */
+}
+function refPending() { try { return sessionStorage.getItem("kakiRef") || localStorage.getItem("kakiRef") || ""; } catch (_) { return ""; } }
+function refClearPending() { try { sessionStorage.removeItem("kakiRef"); localStorage.removeItem("kakiRef"); } catch (_) {} }
+/* 紹介リンク（?ref=コード）で開いたら覚えておき、登録画面の欄にも入れておく */
+(() => { const r = new URLSearchParams(location.search).get("ref"); if (r) refSavePending(r); const p = refPending(); if (p && $("gRef")) $("gRef").value = p; })();
+const jstDay = ms => new Date(ms + 9 * 3600e3).toISOString().slice(0, 10);
+async function refAfterLogin(u) {
+  const R = window.KAKI_CONFIG && window.KAKI_CONFIG.referral; if (!R) return;
+  const myCode = refCodeOf(u.uid);
+  /* ① 自分のコードを公開の引き当て表に置く（1回だけ。置けたら端末に印） */
+  if (localStorage.getItem("kakiRefCode") !== u.uid + ":" + myCode) {
+    try {
+      const ref = doc(db, "kakiapp_refcodes", myCode), snap = await withTimeout(getDoc(ref), 8000, "refcode");
+      if (!snap.exists()) await withTimeout(setDoc(ref, { uid: u.uid, createdAt: new Date().toISOString() }), 8000, "refcodeSet");
+      else if (snap.data().uid !== u.uid) { console.warn("refcode collision", myCode); localStorage.setItem("kakiRefCodeNG", u.uid); }   /* 別の人と同じコード（ごくまれ）＝紹介カードを出さない */
+      localStorage.setItem("kakiRefCode", u.uid + ":" + myCode);
+    } catch (e) { console.warn("refcode", e && e.code); }
+  }
+  /* ② 紹介された人の記録（新しく作ったアカウント・来店前・期間中だけ） */
+  const code = refPending(); if (!code) return;
+  const st = window.kakiGetState();
+  if (st.referredBy || (st.visits || []).length) { refClearPending(); return; }
+  if (window.kakiSyncClock && (await window.kakiSyncClock()) === null) return;   /* 時計が取れない＝次回 */
+  const t = window.kakiToday(), created = jstDay(Date.parse(u.metadata && u.metadata.creationTime) || 0);
+  if (t > R.until || created < R.from || created > R.until) { refClearPending(); return; }
+  if (code === myCode) { refClearPending(); return; }   /* 自分のコード */
+  try {
+    const cs = await withTimeout(getDoc(doc(db, "kakiapp_refcodes", code)), 8000, "refLookup");
+    if (!cs.exists() || cs.data().uid === u.uid) { refClearPending(); return; }
+    const referrer = cs.data().uid, rref = doc(db, "kakiapp_referrals", u.uid);
+    const ex = await withTimeout(getDoc(rref), 8000, "refGet");
+    if (!ex.exists()) await withTimeout(setDoc(rref, { referrer, referee: u.uid, code, createdAt: new Date().toISOString(), status: "pending" }), 8000, "refSet");
+    const d = ex.exists() ? ex.data() : { referrer, code, status: "pending" };
+    const s2 = window.kakiGetState(); s2.referredBy = { uid: d.referrer, code: d.code, at: t, status: d.status }; window.kakiSetState(s2); window.cloudPush();
+    refClearPending();
+  } catch (e) { console.warn("referral", e && e.code); }   /* 通信失敗は次回の起動でやり直す（コードは残す） */
+}
+window.kakiRef = {
+  code: () => (uid && localStorage.getItem("kakiRefCodeNG") !== uid ? refCodeOf(uid) : ""),
+  /* 紹介された人: pending → qualified（ルールで「本人・pending からだけ・この2項目だけ」） */
+  qualify: async () => { if (!uid) throw Object.assign(new Error("not signed in"), { code: "ref/auth" });
+    await withTimeout(updateDoc(doc(db, "kakiapp_referrals", uid), { status: "qualified", qualifiedAt: new Date().toISOString() }), 10000, "refQualify"); },
+  /* 紹介した人: 自分宛ての成立分 */
+  qualified: async () => { if (!uid) return [];
+    const snap = await withTimeout(getDocs(query(collection(db, "kakiapp_referrals"), where("referrer", "==", uid), where("status", "==", "qualified"))), 12000, "refList");
+    const arr = []; snap.forEach(d => arr.push(Object.assign({ id: d.id }, d.data()))); arr.sort((a, b) => String(a.qualifiedAt || "").localeCompare(String(b.qualifiedAt || ""))); return arr; },
+};
+
 /* ---- 入口 ---- */
 
 /* 見張り: 認証の初期化が黙って止まったら、裏の画面を触らせずに知らせる（原因調査用） */
@@ -419,6 +489,7 @@ onAuthStateChanged(auth, async (u) => {
     ready = true;
     hideGate();
     window.kakiStart();
+    refAfterLogin(u).then(() => window.kakiSetState(window.kakiGetState())).catch(e => console.warn("ref", e));   /* 紹介コードの登録・紹介の記録（裏で） */
     $("acctMail").textContent = u.email || u.displayName || (u.phoneNumber ? u.phoneNumber.replace("+81", "0") : "");
 
   } catch (e) {

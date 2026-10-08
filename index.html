@@ -6,7 +6,7 @@
 <title>柿川亭アプリ</title>
 <link rel="icon" href="assets/icon.png">
 <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
-<script src="config.js?v=20260910"></script>
+<script src="config.js?v=20261008"></script>
 <style>
   :root {
     /* masaの参考デザイン（2026-09-06）: 生成り・赤茶・紺・金 */
@@ -285,6 +285,8 @@
         <input type="checkbox" id="gOptIn" checked style="width:19px;height:19px;margin-top:1px;flex:none">
         <span>柿川亭からのお得な情報（新メニュー・限定クーポン）をメールで受け取る<br><span style="color:#9c9384">※あとから止められます</span></span>
       </label>
+      <label for="gRef">紹介コード（お持ちの方だけ・6文字）</label>
+      <input id="gRef" type="text" autocomplete="off" autocapitalize="characters" maxlength="6" placeholder="例：AB23CD">
       <div style="margin-top:16px"><button class="primary" id="gDoSignup">登録する</button></div>
       <div class="links"><button class="link" id="gToSignin">ログインに戻る</button></div>
     </div>
@@ -492,6 +494,14 @@
           <div class="muted">累計来店 <span id="myVisits">0</span>回</div>
         </div>
       </div>
+    </div>
+    <div class="card" id="refBox" style="display:none">
+      <h2 id="refTitle">友だち紹介キャンペーン</h2>
+      <p class="muted">友だちがあなたの紹介コードで登録して、お店で初めて来店ガチャを回したら、あなたと友だちの両方に <b id="refPts">50</b>P。</p>
+      <div style="margin:10px 0 4px;font-size:12px;color:var(--muted, #9c9384)">あなたの紹介コード</div>
+      <div id="refCode" style="font-size:28px;font-weight:700;letter-spacing:6px;text-align:center;padding:8px 0;border:1.5px dashed var(--line);border-radius:10px">——</div>
+      <button class="small" id="btnRefShare" style="margin-top:10px;width:100%">紹介リンクを送る</button>
+      <p class="muted" id="refCount" style="margin-top:8px;text-align:center"></p>
     </div>
     <div class="card" id="myCardsBox" style="display:none">
       <h2>コレクション</h2>
@@ -869,6 +879,58 @@ function render() {
   document.getElementById("txList").innerHTML = tx.length
     ? tx.map(t => `<div class="itemrow"><span>${t.d}　${t.label}</span><span class="pt">${t.points > 0 ? "+" : ""}${t.points}P</span></div>`).join("")
     : "まだ履歴がありません";
+  refRender();
+}
+
+/* ---------- 友だち紹介キャンペーン（masa 決定 2026-10-08） ----------
+ * 紹介コード＝uid から決まる6文字（auth.js の kakiRef.code）。kakiapp_refcodes/{コード} に {uid} を置いて、新しい人がコード→紹介者を引ける。
+ * 新規登録した人が ?ref=コード か登録画面の入力でコードを持っていたら、auth.js が kakiapp_referrals/{自分のuid} を status:"pending" で作る（1人1回）。
+ * 成立＝紹介された人が期間中に初めて来店ガチャを回した → 紹介された人に +points、referrals を "qualified" に（refQualify）。
+ * 紹介した人は起動時に自分宛ての "qualified" を数えて、未受取の分を maxPerReferrer 人まで受け取る（applyReferrals）。相手の会員データには一切書かない */
+const REF_URL = "https://kakigawatei.github.io/kakiapp/?ref=";
+function refRender() {
+  const R = C.referral, box = document.getElementById("refBox"); if (!R || !box) return;
+  const code = window.kakiRef ? window.kakiRef.code() : "";
+  const inPeriod = today() <= R.until;
+  box.style.display = code && inPeriod ? "block" : "none";
+  if (!code || !inPeriod) return;
+  const m = R.until.slice(5).split("-").map(Number);
+  document.getElementById("refTitle").textContent = "友だち紹介キャンペーン（" + m[0] + "/" + m[1] + "まで）";
+  document.getElementById("refPts").textContent = R.points;
+  document.getElementById("refCode").textContent = code;
+  document.getElementById("refCount").textContent = "成立 " + Object.keys(store.s.refClaimed || {}).length + "人／最大" + R.maxPerReferrer + "人";
+}
+document.getElementById("btnRefShare").onclick = async () => {
+  const code = window.kakiRef ? window.kakiRef.code() : ""; if (!code) return;
+  const url = REF_URL + code, text = "柿川亭アプリに登録して、お店で来店ガチャを回すと " + C.referral.points + "P もらえるよ。紹介コード：" + code;
+  try { if (navigator.share) await navigator.share({ title: "柿川亭アプリ", text, url }); else { await navigator.clipboard.writeText(text + " " + url); window.kakiAlert("紹介文とリンクをコピーしました。LINE などに貼って送ってください。"); } } catch (e) {}
+};
+/* 紹介された側: 来店ガチャを回した直後（と、通信失敗で取りこぼした時のために起動時）に呼ぶ */
+let refQualifying = false;
+async function refQualify() {
+  const R = C.referral, rb = store.s.referredBy;
+  if (!R || !rb || rb.status !== "pending" || !rb.spun || refQualifying || !window.kakiRef) return;
+  if ((await syncClock()) === null || today() > R.until) return;
+  refQualifying = true;
+  try {
+    await window.kakiRef.qualify();   /* referrals を pending→qualified（1回だけ・ルールで保証）。失敗したら加点しない */
+    const s = store.s; const rb2 = Object.assign({}, s.referredBy, { status: "qualified", qualifiedAt: today() });
+    store.set({ points: (s.points || 0) + R.points, referredBy: rb2 });
+    logTx("紹介キャンペーン（紹介された）", R.points);
+    celebrateNext(R.points, "友だち紹介キャンペーン成立！");
+  } catch (e) { console.warn("ref qualify", e && e.code); }
+  finally { refQualifying = false; }
+}
+/* 紹介した側: 起動時に成立分を受け取る */
+async function applyReferrals() {
+  const R = C.referral; if (!R || !window.kakiRef) return;
+  let list; try { list = await window.kakiRef.qualified(); } catch (e) { console.warn("ref list", e && e.code); return; }
+  const got = Object.assign({}, store.s.refClaimed || {}); let n = Object.keys(got).length; const add = [];
+  for (const r of list) { if (got[r.id] || n >= R.maxPerReferrer) continue; got[r.id] = today(); n++; add.push(r.id); }
+  if (!add.length) { refRender(); return; }
+  store.set({ points: (store.s.points || 0) + R.points * add.length, refClaimed: got });
+  add.forEach(() => logTx("紹介キャンペーン（紹介した）", R.points));
+  celebrateNext(R.points * add.length, "友だち紹介が " + add.length + "人 成立しました！");
 }
 
 function show(page) {
@@ -886,7 +948,15 @@ function celebrate(points, sub) {
   document.getElementById("ovSub").textContent = sub;
   document.getElementById("overlay").classList.add("show");
 }
-document.getElementById("ovClose").onclick = () => document.getElementById("overlay").classList.remove("show");
+/* お祝いが重なったとき（ガチャの直後に紹介成立など）は、閉じてから次を出す */
+const celebQ = [];
+function celebrateNext(points, sub) {
+  if (document.getElementById("overlay").classList.contains("show")) celebQ.push([points, sub]); else celebrate(points, sub);
+}
+document.getElementById("ovClose").onclick = () => {
+  document.getElementById("overlay").classList.remove("show");
+  if (celebQ.length) { const n = celebQ.shift(); setTimeout(() => celebrate(n[0], n[1]), 350); }
+};
 
 /* ルーレット盤（SVGで生成・configのマス構成） */
 const segs = C.roulette.segments;
@@ -1056,6 +1126,9 @@ document.getElementById("btnGacha").onclick = async () => {
   for (const row of C.visitGacha.table) { acc += row.rate; if (roll < acc) { hit = row; break; } }
   store.set({ points: (store.s.points || 0) + hit.points, gachaDate: today() });
   logTx("来店ガチャ", hit.points);
+  /* 紹介キャンペーン: 紹介された人の初ガチャ＝成立。印だけ先に付ける（演出中に閉じられても、次の起動で成立させる） */
+  const rbNow = store.s.referredBy;
+  if (rbNow && rbNow.status === "pending" && !rbNow.spun) store.set({ referredBy: Object.assign({}, rbNow, { spun: today() }) });
 
   // ① ガチャ機が揺れる
   const img = document.getElementById("gachaImg");
@@ -1063,7 +1136,7 @@ document.getElementById("btnGacha").onclick = async () => {
   setTimeout(() => {
     img.classList.remove("gshake");
     /* ② カプセルが落ちてくる（白黒赤の描画演出・2026-09-06 動画をやめた） */
-    showCapsule(hit.points >= 50, () => celebrate(hit.points, hit.points >= 50 ? "大当たり！" : "来店ガチャ"));
+    showCapsule(hit.points >= 50, () => { celebrate(hit.points, hit.points >= 50 ? "大当たり！" : "来店ガチャ"); refQualify(); });
   }, 1900);
 };
 
@@ -1454,6 +1527,8 @@ document.getElementById("btnTeamLeave").onclick = async () => {
 };
 
 window.kakiGetState = () => store.s;
+window.kakiToday = today;   /* auth.js（紹介キャンペーンの期間判定）がサーバー時刻の「今日」を使う */
+window.kakiSyncClock = syncClock;
 window.kakiSetState = (o) => { localStorage.setItem("kakiapp", JSON.stringify(o || {})); render(); };
 window.kakiStart = function () {
   if (store.s.devMode) document.getElementById("devPanel").style.display = "block";
@@ -1479,6 +1554,8 @@ window.kakiStart = function () {
   shogoOpen();
   if (!applyRankBonus()) fetchCampaigns();   /* クラウドから戻した後に判定（この位置を守る）。ランク分が出た起動ではキャンペーンは次回 */
   else setTimeout(fetchCampaigns, 4000);
+  /* 友だち紹介: 紹介した側の受け取り（キャンペーンのお祝いと重ならないよう少し後）／紹介された側の取りこぼし分の成立 */
+  setTimeout(() => { applyReferrals(); refQualify(); }, 5000);
   /* 高校対抗: 統合・改名の反映 → ホームのカードとランキングを描く（裏で。失敗しても本体は動く） */
   if (window.kakiTeams) window.kakiTeams.sync().catch(() => {}).then(() => teamRender(true)).then(() => cardsRender()).catch(() => {});
 };
