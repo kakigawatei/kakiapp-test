@@ -1549,7 +1549,8 @@ document.getElementById("btnNickSave").onclick = () => {
 };
 document.getElementById("btnGoTeam").onclick = () => { show("team"); teamRender(true); };
 document.getElementById("btnTeamShare").onclick = async () => {
-  const url = "https://kakigawatei.github.io/kakiapp/get/", text = "柿川亭アプリの「学校対抗 来店バトル」" + (store.s.team ? "、" + store.s.team + "で参加してる。" : "。") + "一緒に上位を目指そう！";
+  const rc = window.kakiRef && C.referral && today() <= C.referral.until ? window.kakiRef.code() : "";   /* 紹介キャンペーン中は紹介コードつき（成立で双方 +P）2026-10-08 masa */
+  const url = rc ? REF_URL + rc : "https://kakigawatei.github.io/kakiapp/get/", text = "柿川亭アプリの「学校対抗 来店バトル」" + (store.s.team ? "、" + store.s.team + "で参加してる。" : "。") + "一緒に上位を目指そう！" + (rc ? "登録してお店で来店ガチャを回すと " + C.referral.points + "P もらえるよ。紹介コード：" + rc : "");
   try { if (navigator.share) await navigator.share({ title: "柿川亭アプリ", text, url }); else { await navigator.clipboard.writeText(text + " " + url); window.kakiAlert("誘い文句とリンクをコピーしました。LINE などに貼って送ってください。"); } } catch (e) {}
 };
 document.getElementById("btnTeamBack").onclick = () => show("home");
